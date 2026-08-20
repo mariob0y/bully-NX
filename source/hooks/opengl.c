@@ -46,12 +46,12 @@ int NVEventEGLInit(void)
   EGLint numConfigs = 0;
   EGLConfig eglConfig;
 
-  const EGLint contextAttribs[] = {
-      EGL_CONTEXT_CLIENT_VERSION, 2,
+  EGLint contextAttribs[] = {
+      EGL_CONTEXT_CLIENT_VERSION, 3,
       EGL_NONE};
 
-  const EGLint configAttribs[] = {
-      EGL_RENDERABLE_TYPE, EGL_OPENGL_ES_BIT,
+  EGLint configAttribs[] = {
+      EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
       EGL_RED_SIZE, 8,
       EGL_GREEN_SIZE, 8,
       EGL_BLUE_SIZE, 8,
@@ -82,6 +82,12 @@ int NVEventEGLInit(void)
   eglChooseConfig(display, configAttribs, &eglConfig, 1, &numConfigs);
   if (numConfigs <= 0)
   {
+    debugPrintf("EGL: ES3 config request returned no matches, trying ES2 bit...\n");
+    configAttribs[1] = EGL_OPENGL_ES2_BIT;
+    eglChooseConfig(display, configAttribs, &eglConfig, 1, &numConfigs);
+  }
+  if (numConfigs <= 0)
+  {
     debugPrintf("EGL: No matching config: %08x\n", eglGetError());
     return 0;
   }
@@ -96,6 +102,12 @@ int NVEventEGLInit(void)
   context = eglCreateContext(display, eglConfig, EGL_NO_CONTEXT, contextAttribs);
   if (!context)
   {
+    debugPrintf("EGL: Could not create GLES3 context, fallback to GLES2 context...\n");
+    contextAttribs[1] = 2;
+    context = eglCreateContext(display, eglConfig, EGL_NO_CONTEXT, contextAttribs);
+  }
+  if (!context)
+  {
     debugPrintf("EGL: Could not create context: %08x\n", eglGetError());
     return 0;
   }
@@ -104,6 +116,8 @@ int NVEventEGLInit(void)
   if (eglSwapInterval(display, 1) == EGL_FALSE)
     debugPrintf("EGL: Could not set swap interval: %08x\n", eglGetError());
 
+  debugPrintf("GL_VERSION: %s\n", glGetString(GL_VERSION));
+  debugPrintf("GL_RENDERER: %s\n", glGetString(GL_RENDERER));
   debugPrintf("GL_EXTENSIONS: %s\n", glGetString(GL_EXTENSIONS));
 
   return 1; // success

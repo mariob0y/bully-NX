@@ -26,8 +26,8 @@
 Config config;
 
 // actual screen size that is in use right now
-int screen_width = 960;
-int screen_height = 540;
+int screen_width = 1280;
+int screen_height = 720;
 
 static inline void parse_var(const char *name, const char *value) {
 #define CONFIG_VAR_INT(var)                                                    \

@@ -72,6 +72,48 @@ void userAppExit(void)
 
 #endif
 
+#include <signal.h>
+
+static void crash_signal_handler(int sig)
+{
+  FILE *f = fopen(LOG_NAME, "a");
+  if (f)
+  {
+    fprintf(f, "\n\n========================================================\n");
+    fprintf(f, "=== FATAL CRASH: SIGNAL %d RECEIVED ===\n", sig);
+    switch (sig)
+    {
+    case SIGSEGV: fprintf(f, "Signal: SIGSEGV (Segmentation Fault / Invalid Memory Access)\n"); break;
+    case SIGBUS:  fprintf(f, "Signal: SIGBUS (Bus Error / Alignment Fault)\n"); break;
+    case SIGILL:  fprintf(f, "Signal: SIGILL (Illegal Instruction)\n"); break;
+    case SIGABRT: fprintf(f, "Signal: SIGABRT (Abort / Assertion Failure)\n"); break;
+    case SIGFPE:  fprintf(f, "Signal: SIGFPE (Floating Point Exception)\n"); break;
+    default:      fprintf(f, "Signal: %d\n", sig); break;
+    }
+    u64 mem_total = 0, mem_used = 0;
+    svcGetInfo(&mem_total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&mem_used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    fprintf(f, "Memory: %llu / %llu MB used (%.1f%%)\n",
+            (unsigned long long)(mem_used >> 20),
+            (unsigned long long)(mem_total >> 20),
+            mem_total ? (double)mem_used / (double)mem_total * 100.0 : 0.0);
+    fprintf(f, "========================================================\n\n");
+    fflush(f);
+    fclose(f);
+  }
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+void install_crash_handler(void)
+{
+  signal(SIGSEGV, crash_signal_handler);
+  signal(SIGBUS,  crash_signal_handler);
+  signal(SIGILL,  crash_signal_handler);
+  signal(SIGFPE,  crash_signal_handler);
+  signal(SIGABRT, crash_signal_handler);
+}
+
 int debugPrintf(const char *text, ...)
 {
 #ifdef DEBUG_LOG
@@ -90,6 +132,7 @@ int debugPrintf(const char *text, ...)
     va_start(list, text);
     vfprintf(f, text, list);
     va_end(list);
+    fflush(f);
     fclose(f);
   }
 #endif

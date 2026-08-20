@@ -1244,36 +1244,461 @@ static void egl_call_unlock(void)
   pthread_mutex_unlock(&s_egl_call_mutex);
 }
 
+// ---------------------------------------------------------------------------
+// Per-thread cache of the last successful eglMakeCurrent: the engine re-binds
+// the same context+surface many times per frame and mesa revalidates each time.
+// ---------------------------------------------------------------------------
+#define MC_SLOTS 8
+static struct {
+  void *key;
+  EGLDisplay dpy; EGLSurface draw, read; EGLContext ctx;
+} g_mc[MC_SLOTS];
+
+static inline void *mc_thread_key(void) {
+  void *p;
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(p));
+  return p;
+}
+
+// GL redundant-state cache. Set glc_enabled = 0 for pass-through during debugging.
+static int glc_enabled = 0;
+
+#define GLC_MAXCAPS 24
+static struct { GLenum cap; GLboolean on; } glc_caps[GLC_MAXCAPS];
+static int glc_ncaps;
+
+static struct {
+  int have_blend;  GLenum bsf, bdf;
+  int have_dfunc;  GLenum dfunc;
+  int have_dmask;  GLboolean dmask;
+  int have_cull;   GLenum cull;
+  int have_front;  GLenum front;
+  int have_cmask;  GLboolean cr, cg, cb, ca;
+  int have_active; GLenum active;
+  int have_prog;   GLuint prog;
+  GLuint tex2d[8]; int have_tex2d[8];
+} glc;
+
+static int gl_draw_count = 0;
+
+static void gl_state_cache_reset(void) {
+  glc_ncaps = 0;
+  memset(&glc, 0, sizeof(glc));
+}
+
+static void glEnable_c(GLenum cap) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glEnable: cap=0x%x\n", cap);
+  if (glc_enabled) {
+    for (int i = 0; i < glc_ncaps; i++)
+      if (glc_caps[i].cap == cap) {
+        if (glc_caps[i].on) return;
+        glc_caps[i].on = GL_TRUE; glEnable(cap); return;
+      }
+    if (glc_ncaps < GLC_MAXCAPS) {
+      glc_caps[glc_ncaps].cap = cap; glc_caps[glc_ncaps].on = GL_TRUE; glc_ncaps++;
+    }
+  }
+  glEnable(cap);
+}
+static void glDisable_c(GLenum cap) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glDisable: cap=0x%x\n", cap);
+  if (glc_enabled) {
+    for (int i = 0; i < glc_ncaps; i++)
+      if (glc_caps[i].cap == cap) {
+        if (!glc_caps[i].on) return;
+        glc_caps[i].on = GL_FALSE; glDisable(cap); return;
+      }
+    if (glc_ncaps < GLC_MAXCAPS) {
+      glc_caps[glc_ncaps].cap = cap; glc_caps[glc_ncaps].on = GL_FALSE; glc_ncaps++;
+    }
+  }
+  glDisable(cap);
+}
+static void glBlendFunc_c(GLenum s, GLenum d) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glBlendFunc: s=0x%x d=0x%x\n", s, d);
+  if (glc_enabled && glc.have_blend && glc.bsf == s && glc.bdf == d) return;
+  glc.have_blend = 1; glc.bsf = s; glc.bdf = d;
+  glBlendFunc(s, d);
+}
+static void glBlendFuncSeparate_c(GLenum sc, GLenum dc, GLenum sa, GLenum da) {
+  glc.have_blend = 0;
+  glBlendFuncSeparate(sc, dc, sa, da);
+}
+static void glDepthFunc_c(GLenum f) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glDepthFunc: func=0x%x\n", f);
+  if (glc_enabled && glc.have_dfunc && glc.dfunc == f) return;
+  glc.have_dfunc = 1; glc.dfunc = f;
+  glDepthFunc(f);
+}
+static void glDepthMask_c(GLboolean m) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glDepthMask: mask=%d\n", m);
+  if (glc_enabled && glc.have_dmask && glc.dmask == m) return;
+  glc.have_dmask = 1; glc.dmask = m;
+  glDepthMask(m);
+}
+static void glCullFace_c(GLenum m) {
+  if (glc_enabled && glc.have_cull && glc.cull == m) return;
+  glc.have_cull = 1; glc.cull = m;
+  glCullFace(m);
+}
+static void glFrontFace_c(GLenum m) {
+  if (glc_enabled && glc.have_front && glc.front == m) return;
+  glc.have_front = 1; glc.front = m;
+  glFrontFace(m);
+}
+static void glColorMask_c(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
+  if (glc_enabled && glc.have_cmask && glc.cr == r && glc.cg == g &&
+      glc.cb == b && glc.ca == a)
+    return;
+  glc.have_cmask = 1; glc.cr = r; glc.cg = g; glc.cb = b; glc.ca = a;
+  glColorMask(r, g, b, a);
+}
+static void glActiveTexture_c(GLenum unit) {
+  if (glc_enabled && glc.have_active && glc.active == unit) return;
+  glc.have_active = 1; glc.active = unit;
+  glActiveTexture(unit);
+}
+static void glBindTexture_c(GLenum target, GLuint tex) {
+  if (glc_enabled && target == GL_TEXTURE_2D && glc.have_active) {
+    unsigned idx = (unsigned)(glc.active - GL_TEXTURE0);
+    if (idx < 8) {
+      if (glc.have_tex2d[idx] && glc.tex2d[idx] == tex) return;
+      glc.have_tex2d[idx] = 1; glc.tex2d[idx] = tex;
+    }
+  }
+  glBindTexture(target, tex);
+}
+static void glUseProgram_c(GLuint p) {
+  if (glc_enabled && glc.have_prog && glc.prog == p) return;
+  glc.have_prog = 1; glc.prog = p;
+  glUseProgram(p);
+}
+static void glDeleteTextures_c(GLsizei n, const GLuint *t) {
+  memset(glc.have_tex2d, 0, sizeof(glc.have_tex2d));
+  glDeleteTextures(n, t);
+}
+static void glDeleteProgram_c(GLuint p) {
+  if (glc.have_prog && glc.prog == p) glc.have_prog = 0;
+  glDeleteProgram(p);
+}
+
+static void gl_load_drain(void) {
+  static unsigned n = 0;
+  if ((++n & 0x1ff) == 0) glFlush();
+}
+
+static void glTexImage2D_w(GLenum t, GLint l, GLint i, GLsizei w, GLsizei h,
+                           GLint b, GLenum f, GLenum y, const void *p) {
+  gl_load_drain();
+  glTexImage2D(t, l, i, w, h, b, f, y, p);
+}
+static void glCompressedTexImage2D_w(GLenum t, GLint l, GLenum i, GLsizei w,
+                                     GLsizei h, GLint b, GLsizei s, const void *d) {
+  gl_load_drain();
+  glCompressedTexImage2D(t, l, i, w, h, b, s, d);
+}
+static void glBufferData_w(GLenum target, GLsizeiptr size, const void *data,
+                           GLenum usage) {
+  gl_load_drain();
+  glBufferData(target, size, data, usage);
+}
+
 EGLBoolean eglMakeCurrent_wrapper(EGLDisplay dpy, EGLSurface draw,
                                   EGLSurface read, EGLContext ctx)
 {
-  EGLBoolean ok;
+  void *key = mc_thread_key();
+  int slot = -1, freeslot = -1;
+  for (int i = 0; i < MC_SLOTS; i++) {
+    if (g_mc[i].key == key) { slot = i; break; }
+    if (!g_mc[i].key && freeslot < 0) freeslot = i;
+  }
 
   ensure_egl_init();
-  egl_call_lock();
-  if (ctx == EGL_NO_CONTEXT || draw == EGL_NO_SURFACE)
+
+  EGLSurface real_draw = (draw == EGL_NO_SURFACE) ? EGL_NO_SURFACE : g_egl_surface;
+  EGLSurface real_read = (read == EGL_NO_SURFACE) ? EGL_NO_SURFACE : g_egl_surface;
+  EGLContext real_ctx  = (ctx == EGL_NO_CONTEXT)  ? EGL_NO_CONTEXT  : g_egl_context;
+
+  // If this exact context state is already active on this thread, skip the call
+  if (slot >= 0 && g_mc[slot].key == key && g_mc[slot].dpy == g_egl_display &&
+      g_mc[slot].draw == real_draw && g_mc[slot].read == real_read &&
+      g_mc[slot].ctx == real_ctx)
   {
-    debugPrintf("eglMakeCurrent_wrapper: RELEASING context on current thread\n");
-    ok = eglMakeCurrent(g_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    if (ok == EGL_FALSE)
-      debugPrintf("eglMakeCurrent_wrapper: release FAILED err=0x%x\n", eglGetError());
-    egl_call_unlock();
-    return ok;
+    return EGL_TRUE;
   }
-  debugPrintf("eglMakeCurrent_wrapper: ACQUIRING context on current thread\n");
-  ok = eglMakeCurrent(g_egl_display, g_egl_surface, g_egl_surface, g_egl_context);
+
+  egl_call_lock();
+  EGLBoolean ok = eglMakeCurrent(g_egl_display, real_draw, real_read, real_ctx);
   if (ok == EGL_FALSE)
-    debugPrintf("eglMakeCurrent_wrapper: acquire FAILED err=0x%x\n", eglGetError());
+  {
+    debugPrintf("eglMakeCurrent_wrapper: bind FAILED err=0x%x (ctx=%p)\n", eglGetError(), ctx);
+    if (slot >= 0) g_mc[slot].key = NULL;
+  }
+  else
+  {
+    gl_state_cache_reset();
+    if (slot < 0) slot = (freeslot >= 0) ? freeslot : 0;
+    g_mc[slot].key  = key;
+    g_mc[slot].dpy  = g_egl_display;
+    g_mc[slot].draw = real_draw;
+    g_mc[slot].read = real_read;
+    g_mc[slot].ctx  = real_ctx;
+  }
   egl_call_unlock();
   return ok;
 }
 
 // GL debug wrappers — trace key calls to see if game ever reaches rendering
 static int gl_clear_count = 0;
-static int gl_draw_count = 0;
 static int gl_viewport_count = 0;
 static int gl_shader_count = 0;
 static int g_egl_swap_count = 0;
+
+static int gl_program_count = 0;
+static int gl_tex_bind_count = 0;
+static int gl_vao_count = 0;
+static int gl_attrib_count = 0;
+static int gl_buf_bind_count = 0;
+static int gl_buf_data_count = 0;
+static int gl_uniform_count = 0;
+
+void glAttachShader_wrapper(GLuint program, GLuint shader)
+{
+  if (program >= 380 || gl_draw_count <= 5)
+    debugPrintf("glAttachShader: prog=%u shader=%u\n", program, shader);
+  glAttachShader(program, shader);
+}
+
+void glCompileShader_wrapper(GLuint shader)
+{
+  glCompileShader(shader);
+  GLint status = 0;
+  glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
+  if (status == GL_FALSE)
+  {
+    char logbuf[1024];
+    glGetShaderInfoLog(shader, sizeof(logbuf), NULL, logbuf);
+    debugPrintf("glCompileShader FAILED shader=%u:\n%s\n", shader, logbuf);
+  }
+}
+
+void glLinkProgram_wrapper(GLuint program)
+{
+  glLinkProgram(program);
+  GLint status = 0;
+  glGetProgramiv(program, GL_LINK_STATUS, &status);
+  if (status == GL_FALSE || program >= 380 || gl_draw_count <= 5)
+  {
+    char logbuf[1024];
+    logbuf[0] = '\0';
+    glGetProgramInfoLog(program, sizeof(logbuf), NULL, logbuf);
+    debugPrintf("glLinkProgram: prog=%u status=%s log: %.200s\n",
+                program, status == GL_TRUE ? "OK" : "FAILED", logbuf);
+  }
+}
+
+void glBindBuffer_wrapper(GLenum target, GLuint buffer)
+{
+  gl_buf_bind_count++;
+  if (gl_buf_bind_count <= 20)
+    debugPrintf("glBindBuffer: target=0x%x buf=%u (call #%d)\n", target, buffer, gl_buf_bind_count);
+  glBindBuffer(target, buffer);
+}
+
+void glBufferData_wrapper(GLenum target, GLsizeiptr size, const void *data, GLenum usage)
+{
+  gl_buf_data_count++;
+  if (gl_buf_data_count <= 20)
+    debugPrintf("glBufferData: target=0x%x size=%ld data=%p (call #%d)\n", target, (long)size, data, gl_buf_data_count);
+  gl_load_drain();
+  glBufferData(target, size, data, usage);
+}
+
+void glUniformMatrix4fv_wrapper(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
+{
+  gl_uniform_count++;
+  if (gl_uniform_count <= 10)
+    debugPrintf("glUniformMatrix4fv: loc=%d count=%d (call #%d)\n", location, count, gl_uniform_count);
+  glUniformMatrix4fv(location, count, transpose, value);
+}
+
+void glUniform1i_wrapper(GLint location, GLint v0)
+{
+  if (gl_uniform_count <= 10)
+    debugPrintf("glUniform1i: loc=%d v0=%d\n", location, v0);
+  glUniform1i(location, v0);
+}
+
+void glActiveTexture_wrapper(GLenum unit) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glActiveTexture: unit=0x%x\n", unit);
+  glActiveTexture_c(unit);
+}
+
+void glEnableVertexAttribArray_wrapper(GLuint index) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glEnableVertexAttribArray: idx=%u\n", index);
+  glEnableVertexAttribArray(index);
+}
+
+void glDisableVertexAttribArray_wrapper(GLuint index) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glDisableVertexAttribArray: idx=%u\n", index);
+  glDisableVertexAttribArray(index);
+}
+
+void glUniform4fv_wrapper(GLint location, GLsizei count, const GLfloat *value) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glUniform4fv: loc=%d count=%d val0=%f\n", location, count, value ? value[0] : 0.0f);
+  glUniform4fv(location, count, value);
+}
+
+void glUniform3fv_wrapper(GLint location, GLsizei count, const GLfloat *value) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glUniform3fv: loc=%d count=%d val0=%f\n", location, count, value ? value[0] : 0.0f);
+  glUniform3fv(location, count, value);
+}
+
+void glUniform1f_wrapper(GLint location, GLfloat v0) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glUniform1f: loc=%d v0=%f\n", location, v0);
+  glUniform1f(location, v0);
+}
+
+void glTexParameteri_wrapper(GLenum target, GLenum pname, GLint param) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glTexParameteri: target=0x%x pname=0x%x param=0x%x\n", target, pname, param);
+  glTexParameteri(target, pname, param);
+}
+
+void glScissor_wrapper(GLint x, GLint y, GLsizei width, GLsizei height) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glScissor: %d,%d %dx%d\n", x, y, width, height);
+  glScissor(x, y, width, height);
+}
+
+void glPolygonOffset_wrapper(GLfloat factor, GLfloat units) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glPolygonOffset: factor=%f units=%f\n", factor, units);
+  glPolygonOffset(factor, units);
+}
+
+void glStencilMask_wrapper(GLuint mask) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glStencilMask: mask=0x%x\n", mask);
+  glStencilMask(mask);
+}
+
+void glStencilFunc_wrapper(GLenum func, GLint ref, GLuint mask) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glStencilFunc: func=0x%x ref=%d mask=0x%x\n", func, ref, mask);
+  glStencilFunc(func, ref, mask);
+}
+
+void glStencilOp_wrapper(GLenum fail, GLenum zfail, GLenum zpass) {
+  if (gl_draw_count <= 5)
+    debugPrintf("glStencilOp: fail=0x%x zfail=0x%x zpass=0x%x\n", fail, zfail, zpass);
+  glStencilOp(fail, zfail, zpass);
+}
+
+void glDrawBuffers_wrapper(GLsizei n, const GLenum *bufs)
+{
+  if (gl_draw_count <= 10)
+    debugPrintf("glDrawBuffers: n=%d buf0=0x%x\n", n, bufs ? bufs[0] : 0);
+
+  if (!bufs || n <= 0)
+    return;
+
+  // Single attachment GL_COLOR_ATTACHMENT0 or GL_BACK is default in GLES3 FBOs.
+  // Bypassing redundant single-buffer glDrawBuffers calls prevents a Mesa Nouveau driver crash.
+  if (n == 1 && (bufs[0] == GL_COLOR_ATTACHMENT0 || bufs[0] == GL_BACK))
+  {
+    if (gl_draw_count <= 10)
+      debugPrintf("  -> glDrawBuffers skipped (workaround OK)\n");
+    return;
+  }
+
+  glDrawBuffers(n, bufs);
+}
+
+GLenum glCheckFramebufferStatus_wrapper(GLenum target)
+{
+  GLenum status = glCheckFramebufferStatus(target);
+  debugPrintf("glCheckFramebufferStatus: target=0x%x -> status=0x%x (%s)\n",
+              target, status, status == GL_FRAMEBUFFER_COMPLETE ? "COMPLETE" : "INCOMPLETE");
+  return status;
+}
+
+void glBindFramebuffer_wrapper(GLenum target, GLuint framebuffer)
+{
+  if (gl_draw_count <= 10)
+  {
+    debugPrintf("glBindFramebuffer: target=0x%x fb=%u\n", target, framebuffer);
+    glBindFramebuffer(target, framebuffer);
+    if (framebuffer != 0)
+    {
+      GLenum status = glCheckFramebufferStatus(target);
+      debugPrintf("  -> fb=%u status=0x%x (%s)\n",
+                  framebuffer, status, status == GL_FRAMEBUFFER_COMPLETE ? "COMPLETE" : "INCOMPLETE!");
+    }
+    return;
+  }
+  glBindFramebuffer(target, framebuffer);
+}
+
+void glFramebufferTexture2D_wrapper(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level)
+{
+  if (gl_draw_count <= 10)
+    debugPrintf("glFramebufferTexture2D: target=0x%x att=0x%x tex=%u\n", target, attachment, texture);
+  glFramebufferTexture2D(target, attachment, textarget, texture, level);
+}
+
+void glUseProgram_wrapper(GLuint program)
+{
+  gl_program_count++;
+  if (gl_program_count <= 20)
+    debugPrintf("glUseProgram: prog=%u (call #%d) ENTER\n", program, gl_program_count);
+  glUseProgram(program);
+  if (gl_program_count <= 20)
+    debugPrintf("glUseProgram: prog=%u OK\n", program);
+}
+
+GLint glGetUniformLocation_wrapper(GLuint program, const GLchar *name)
+{
+  GLint loc = glGetUniformLocation(program, name);
+  if (gl_draw_count <= 5)
+    debugPrintf("glGetUniformLocation: prog=%u name=\"%s\" -> loc=%d\n", program, name ? name : "NULL", loc);
+  return loc;
+}
+
+void glBindTexture_wrapper(GLenum target, GLuint texture)
+{
+  gl_tex_bind_count++;
+  if (gl_tex_bind_count <= 20)
+    debugPrintf("glBindTexture: target=0x%x tex=%u (call #%d)\n", target, texture, gl_tex_bind_count);
+  glBindTexture(target, texture);
+}
+
+void glBindVertexArray_wrapper(GLuint array)
+{
+  gl_vao_count++;
+  if (gl_vao_count <= 20)
+    debugPrintf("glBindVertexArray: vao=%u (call #%d)\n", array, gl_vao_count);
+  glBindVertexArray(array);
+}
+
+void glVertexAttribPointer_wrapper(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void *pointer)
+{
+  gl_attrib_count++;
+  if (gl_attrib_count <= 20)
+    debugPrintf("glVertexAttribPointer: idx=%u size=%d type=0x%x ptr=%p (call #%d)\n", index, size, type, pointer, gl_attrib_count);
+  glVertexAttribPointer(index, size, type, normalized, stride, pointer);
+}
 
 void glClear_wrapper(GLbitfield mask)
 {
@@ -1315,12 +1740,58 @@ GLuint glCreateShader_wrapper(GLenum type)
   return s;
 }
 
+static char *sanitize_glsl(const char *src)
+{
+  if (!src) return NULL;
+  if (strstr(src, "#version 300 es"))
+  {
+    if (strstr(src, "texture2D(") || strstr(src, "textureCube("))
+    {
+      size_t len = strlen(src);
+      char *new_src = malloc(len + 256);
+      if (new_src)
+      {
+        size_t j = 0;
+        for (size_t i = 0; i < len; )
+        {
+          if (strncmp(&src[i], "texture2D(", 10) == 0)
+          {
+            memcpy(&new_src[j], "texture(", 8);
+            j += 8; i += 10;
+          }
+          else if (strncmp(&src[i], "textureCube(", 12) == 0)
+          {
+            memcpy(&new_src[j], "texture(", 8);
+            j += 8; i += 12;
+          }
+          else
+          {
+            new_src[j++] = src[i++];
+          }
+        }
+        new_src[j] = '\0';
+        return new_src;
+      }
+    }
+  }
+  return NULL;
+}
+
 void glShaderSource_wrapper(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length)
 {
   if (count > 0 && string && string[0])
   {
-    int len = length ? length[0] : (int)strlen(string[0]);
-    debugPrintf("glShaderSource: shader=%u len=%d first80=\"%.80s\"\n", shader, len, string[0]);
+    char *clean = sanitize_glsl(string[0]);
+    const GLchar *src = clean ? clean : string[0];
+    int len = clean ? (int)strlen(clean) : (length ? length[0] : (int)strlen(string[0]));
+    if (shader == 14 || shader == 168 || shader >= 380)
+      debugPrintf("glShaderSource: shader=%u len=%d full:\n%s\n", shader, len, src);
+    else
+      debugPrintf("glShaderSource: shader=%u len=%d\n", shader, len);
+
+    glShaderSource(shader, count, &src, NULL);
+    if (clean) free(clean);
+    return;
   }
   glShaderSource(shader, count, string, length);
 }
@@ -1329,6 +1800,7 @@ EGLBoolean eglSwapBuffers_wrapper(EGLDisplay dpy, EGLSurface surface)
 {
   EGLBoolean ok;
 
+  gl_state_cache_reset();
   egl_call_lock();
   if (g_egl_swap_count < 5 || (g_egl_swap_count % 300 == 0))
     debugPrintf("eglSwapBuffers_wrapper: swap #%d\n", g_egl_swap_count);
@@ -1374,12 +1846,28 @@ EGLBoolean eglDestroySurface_wrapper(EGLDisplay dpy, EGLSurface surface)
   return EGL_TRUE;
 }
 
+static void glDiscardFramebufferEXT_stub(GLenum target, GLsizei numAttachments, const GLenum *attachments)
+{
+  (void)target;
+  (void)numAttachments;
+  (void)attachments;
+}
+
 // eglGetProcAddress wrapper: intercept known EGL/GL function names so that the
 // game cannot bypass our wrappers by calling eglGetProcAddress at runtime.
 void *eglGetProcAddress_wrapper(const char *procname)
 {
   if (!procname)
     return NULL;
+
+  // Extensions known to crash Mesa/Nouveau driver on Switch — return non-NULL no-op stub
+  if (strcmp(procname, "glDiscardFramebufferEXT") == 0 ||
+      strcmp(procname, "glDiscardFramebuffer") == 0 ||
+      strcmp(procname, "glDiscardFramebufferOES") == 0)
+  {
+    debugPrintf("eglGetProcAddress_wrapper(\"%s\") -> stub (no-op)\n", procname);
+    return (void *)glDiscardFramebufferEXT_stub;
+  }
 
   // EGL functions that we wrap
   if (strcmp(procname, "eglGetDisplay") == 0)
@@ -2260,45 +2748,45 @@ DynLibFunction dynlib_functions[] = {
 
     {"getenv", (uintptr_t)&getenv},
 
-    {"glActiveTexture", (uintptr_t)&glActiveTexture},
-    {"glAttachShader", (uintptr_t)&glAttachShader},
+    {"glActiveTexture", (uintptr_t)&glActiveTexture_wrapper},
+    {"glAttachShader", (uintptr_t)&glAttachShader_wrapper},
     {"glBindAttribLocation", (uintptr_t)&glBindAttribLocation},
-    {"glBindBuffer", (uintptr_t)&glBindBuffer},
-    {"glBindFramebuffer", (uintptr_t)&glBindFramebuffer},
+    {"glBindBuffer", (uintptr_t)&glBindBuffer_wrapper},
+    {"glBindFramebuffer", (uintptr_t)&glBindFramebuffer_wrapper},
     {"glBindRenderbuffer", (uintptr_t)&glBindRenderbuffer},
-    {"glBindTexture", (uintptr_t)&glBindTexture},
-    {"glBlendFunc", (uintptr_t)&glBlendFunc},
-    {"glBlendFuncSeparate", (uintptr_t)&glBlendFuncSeparate},
-    {"glBufferData", (uintptr_t)&glBufferData},
-    {"glCheckFramebufferStatus", (uintptr_t)&glCheckFramebufferStatus},
+    {"glBindTexture", (uintptr_t)&glBindTexture_wrapper},
+    {"glBlendFunc", (uintptr_t)&glBlendFunc_c},
+    {"glBlendFuncSeparate", (uintptr_t)&glBlendFuncSeparate_c},
+    {"glBufferData", (uintptr_t)&glBufferData_wrapper},
+    {"glCheckFramebufferStatus", (uintptr_t)&glCheckFramebufferStatus_wrapper},
     {"glClear", (uintptr_t)&glClear_wrapper},
     {"glClearColor", (uintptr_t)&glClearColor},
     {"glClearDepthf", (uintptr_t)&glClearDepthf},
     {"glClearStencil", (uintptr_t)&glClearStencil},
-    {"glCompileShader", (uintptr_t)&glCompileShader},
-    {"glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D},
+    {"glCompileShader", (uintptr_t)&glCompileShader_wrapper},
+    {"glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D_w},
     {"glCreateProgram", (uintptr_t)&glCreateProgram},
     {"glCreateShader", (uintptr_t)&glCreateShader_wrapper},
-    {"glCullFace", (uintptr_t)&glCullFace},
+    {"glCullFace", (uintptr_t)&glCullFace_c},
     {"glDeleteBuffers", (uintptr_t)&glDeleteBuffers},
     {"glDeleteFramebuffers", (uintptr_t)&glDeleteFramebuffers},
-    {"glDeleteProgram", (uintptr_t)&glDeleteProgram},
+    {"glDeleteProgram", (uintptr_t)&glDeleteProgram_c},
     {"glDeleteRenderbuffers", (uintptr_t)&glDeleteRenderbuffers},
     {"glDeleteShader", (uintptr_t)&glDeleteShader},
-    {"glDeleteTextures", (uintptr_t)&glDeleteTextures},
-    {"glDepthFunc", (uintptr_t)&glDepthFunc},
-    {"glDepthMask", (uintptr_t)&glDepthMask},
+    {"glDeleteTextures", (uintptr_t)&glDeleteTextures_c},
+    {"glDepthFunc", (uintptr_t)&glDepthFunc_c},
+    {"glDepthMask", (uintptr_t)&glDepthMask_c},
     {"glDepthRangef", (uintptr_t)&glDepthRangef},
-    {"glDisable", (uintptr_t)&glDisable},
-    {"glDisableVertexAttribArray", (uintptr_t)&glDisableVertexAttribArray},
+    {"glDisable", (uintptr_t)&glDisable_c},
+    {"glDisableVertexAttribArray", (uintptr_t)&glDisableVertexAttribArray_wrapper},
     {"glDrawArrays", (uintptr_t)&glDrawArrays_wrapper},
     {"glDrawElements", (uintptr_t)&glDrawElements_wrapper},
-    {"glEnable", (uintptr_t)&glEnable},
-    {"glEnableVertexAttribArray", (uintptr_t)&glEnableVertexAttribArray},
+    {"glEnable", (uintptr_t)&glEnable_c},
+    {"glEnableVertexAttribArray", (uintptr_t)&glEnableVertexAttribArray_wrapper},
     {"glFinish", (uintptr_t)&glFinish},
     {"glFramebufferRenderbuffer", (uintptr_t)&glFramebufferRenderbuffer},
-    {"glFramebufferTexture2D", (uintptr_t)&glFramebufferTexture2D},
-    {"glFrontFace", (uintptr_t)&glFrontFace},
+    {"glFramebufferTexture2D", (uintptr_t)&glFramebufferTexture2D_wrapper},
+    {"glFrontFace", (uintptr_t)&glFrontFace_c},
     {"glGenBuffers", (uintptr_t)&glGenBuffers},
     {"glGenFramebuffers", (uintptr_t)&glGenFramebuffers},
     {"glGenRenderbuffers", (uintptr_t)&glGenRenderbuffers},
@@ -2312,50 +2800,50 @@ DynLibFunction dynlib_functions[] = {
     {"glGetShaderInfoLog", (uintptr_t)&glGetShaderInfoLogHook},
     {"glGetShaderiv", (uintptr_t)&glGetShaderiv},
     {"glGetString", (uintptr_t)&glGetString},
-    {"glGetUniformLocation", (uintptr_t)&glGetUniformLocation},
+    {"glGetUniformLocation", (uintptr_t)&glGetUniformLocation_wrapper},
     {"glHint", (uintptr_t)&glHint},
-    {"glLinkProgram", (uintptr_t)&glLinkProgram},
-    {"glPolygonOffset", (uintptr_t)&glPolygonOffset},
+    {"glLinkProgram", (uintptr_t)&glLinkProgram_wrapper},
+    {"glPolygonOffset", (uintptr_t)&glPolygonOffset_wrapper},
     {"glReadPixels", (uintptr_t)&glReadPixels},
     {"glRenderbufferStorage", (uintptr_t)&glRenderbufferStorage},
-    {"glScissor", (uintptr_t)&glScissor},
+    {"glScissor", (uintptr_t)&glScissor_wrapper},
     {"glShaderSource", (uintptr_t)&glShaderSource_wrapper},
-    {"glTexImage2D", (uintptr_t)&glTexImage2D},
+    {"glTexImage2D", (uintptr_t)&glTexImage2D_w},
     {"glTexParameterf", (uintptr_t)&glTexParameterf},
-    {"glTexParameteri", (uintptr_t)&glTexParameteri},
-    {"glUniform1f", (uintptr_t)&glUniform1f},
+    {"glTexParameteri", (uintptr_t)&glTexParameteri_wrapper},
+    {"glUniform1f", (uintptr_t)&glUniform1f_wrapper},
     {"glUniform1fv", (uintptr_t)&glUniform1fv},
-    {"glUniform1i", (uintptr_t)&glUniform1i},
+    {"glUniform1i", (uintptr_t)&glUniform1i_wrapper},
     {"glUniform2fv", (uintptr_t)&glUniform2fv},
     {"glUniform3f", (uintptr_t)&glUniform3f},
-    {"glUniform3fv", (uintptr_t)&glUniform3fv},
-    {"glUniform4fv", (uintptr_t)&glUniform4fv},
+    {"glUniform3fv", (uintptr_t)&glUniform3fv_wrapper},
+    {"glUniform4fv", (uintptr_t)&glUniform4fv_wrapper},
     {"glUniformMatrix3fv", (uintptr_t)&glUniformMatrix3fv},
-    {"glUniformMatrix4fv", (uintptr_t)&glUniformMatrix4fv},
-    {"glUseProgram", (uintptr_t)&glUseProgram},
+    {"glUniformMatrix4fv", (uintptr_t)&glUniformMatrix4fv_wrapper},
+    {"glUseProgram", (uintptr_t)&glUseProgram_wrapper},
     {"glVertexAttrib4fv", (uintptr_t)&glVertexAttrib4fv},
-    {"glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer},
+    {"glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer_wrapper},
     {"glViewport", (uintptr_t)&glViewport_wrapper},
 
     // GLES3 functions that Bully uses but Max Payne didn't
-    {"glBindVertexArray", (uintptr_t)&glBindVertexArray},
+    {"glBindVertexArray", (uintptr_t)&glBindVertexArray_wrapper},
     {"glDeleteVertexArrays", (uintptr_t)&glDeleteVertexArrays},
     {"glGenVertexArrays", (uintptr_t)&glGenVertexArrays},
-    {"glColorMask", (uintptr_t)&glColorMask},
-    {"glDrawBuffers", (uintptr_t)&glDrawBuffers},
+    {"glColorMask", (uintptr_t)&glColorMask_c},
+    {"glDrawBuffers", (uintptr_t)&glDrawBuffers_wrapper},
     {"glLineWidth", (uintptr_t)&glLineWidth},
     {"glPixelStorei", (uintptr_t)&glPixelStorei},
-    {"glStencilFunc", (uintptr_t)&glStencilFunc},
-    {"glStencilMask", (uintptr_t)&glStencilMask},
-    {"glStencilOp", (uintptr_t)&glStencilOp},
+    {"glStencilFunc", (uintptr_t)&glStencilFunc_wrapper},
+    {"glStencilMask", (uintptr_t)&glStencilMask_wrapper},
+    {"glStencilOp", (uintptr_t)&glStencilOp_wrapper},
     {"glTexStorage2D", (uintptr_t)&glTexStorage2D},
     {"glTexSubImage2D", (uintptr_t)&glTexSubImage2D},
     {"glCompressedTexSubImage2D", (uintptr_t)&glCompressedTexSubImage2D},
     {"glDrawArrays", (uintptr_t)&glDrawArrays_wrapper},
-    {"glCheckFramebufferStatus", (uintptr_t)&glCheckFramebufferStatus},
+    {"glCheckFramebufferStatus", (uintptr_t)&glCheckFramebufferStatus_wrapper},
     {"glDepthRangef", (uintptr_t)&glDepthRangef},
     {"glHint", (uintptr_t)&glHint},
-    {"glBufferData", (uintptr_t)&glBufferData},
+    {"glBufferData", (uintptr_t)&glBufferData_wrapper},
 
     // OpenAL
     {"alBufferData", (uintptr_t)&alBufferDataHook},

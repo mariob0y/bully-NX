@@ -17,10 +17,10 @@
 
 #define SO_NAME "libBully.so"
 #define CONFIG_NAME "config.txt"
-#define LOG_NAME "debug.log"
+#define LOG_NAME "bully_log.txt"
 
-#define DEBUG_LOG 0
-#define DEBUG_FILE_LOG 0
+#define DEBUG_LOG 1
+#define DEBUG_FILE_LOG 1
 
 // actual screen size
 extern int screen_width;

@@ -14,6 +14,7 @@
 int debugPrintf(const char *text, ...);
 void debugPrintf_setMainThread(void);
 void debugPrintf_setCompatDelayMs(int ms);
+void install_crash_handler(void);
 
 int ret0(void);
 int ret1(void);

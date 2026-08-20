@@ -100,18 +100,16 @@ static void set_screen_size(int w, int h)
 {
   if (w <= 0 || h <= 0 || w > 1920 || h > 1080)
   {
-    // auto; prefer 720p on both handheld and docked.
-    // Full 1080p docked works, but it drives GPU load unnecessarily high for
-    // this Android wrapper and leaves little headroom for the heavier scenes.
+    // Auto resolution: 1920x1080 docked, 1280x720 handheld.
     if (appletGetOperationMode() == AppletOperationMode_Console)
     {
-      screen_width = 960;
-      screen_height = 540;
+      screen_width = 1920;
+      screen_height = 1080;
     }
     else
     {
-      screen_width = 960;
-      screen_height = 540;
+      screen_width = 1280;
+      screen_height = 720;
     }
   }
   else
@@ -119,6 +117,9 @@ static void set_screen_size(int w, int h)
     screen_width = w;
     screen_height = h;
   }
+  NWindow *win = nwindowGetDefault();
+  if (win)
+    nwindowSetDimensions(win, screen_width, screen_height);
   debugPrintf("screen mode: %dx%d\n", screen_width, screen_height);
 }
 
@@ -126,9 +127,26 @@ int main(void)
 {
   int compat_delay_ms = 0;
 
+  debugPrintf_setMainThread();
+  debugPrintf("\n========================================\n");
+  debugPrintf("Bully NX Starting...\n");
+  debugPrintf("========================================\n");
+
+  // Set Mesa GPU driver optimizations & shader cache
+  setenv("MESA_GLTHREAD", "false", 1);
+  setenv("GALLIUM_THREAD", "0", 1);
+  setenv("NOUVEAU_SWITCH_MAPPED_COMPLETION", "1", 1);
+
+  mkdir("shadercache", 0777);
+  setenv("MESA_SHADER_CACHE_DIR", "shadercache", 1);
+  setenv("MESA_SHADER_CACHE_DISABLE", "false", 1);
+
   // try to read the config file and create one with default values if it's missing
   if (read_config(CONFIG_NAME) < 0)
     write_config(CONFIG_NAME);
+
+  // set screen size immediately after reading config
+  set_screen_size(config.screen_width, config.screen_height);
 
   compat_delay_ms = config.timing_workaround_ms;
   if (compat_delay_ms < 0)
