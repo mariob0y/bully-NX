@@ -43,6 +43,7 @@
 #include "util.h"
 #include "hooks.h"
 #include "zip_fs.h"
+#include "overlay.h"
 
 extern uintptr_t __cxa_atexit;
 
@@ -1801,6 +1802,12 @@ EGLBoolean eglSwapBuffers_wrapper(EGLDisplay dpy, EGLSurface surface)
   EGLBoolean ok;
 
   gl_state_cache_reset();
+  // Draw the debug overlay on top of the fully-rendered frame, after the
+  // game's own draw calls but before the buffer is presented. It saves and
+  // restores every piece of GL state it touches, and gl_state_cache_reset()
+  // above already means the game's cached enable/disable shadow state gets
+  // rebuilt from scratch on the next frame either way.
+  overlay_render();
   egl_call_lock();
   if (g_egl_swap_count < 5 || (g_egl_swap_count % 300 == 0))
     debugPrintf("eglSwapBuffers_wrapper: swap #%d\n", g_egl_swap_count);

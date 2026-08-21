@@ -15,6 +15,10 @@
 // transitions and cutscene setup.
 #define MEMORY_MB 1024
 
+// Memory left unclaimed by our own svcSetHeapSize() request, reserved for
+// the graphics driver's own allocations (see __libnx_initheap in main.c).
+#define HEAP_RESERVE_SIZE 0x4000000 // 64 MB
+
 #define SO_NAME "libBully.so"
 #define CONFIG_NAME "config.txt"
 #define LOG_NAME "bully_log.txt"

@@ -39,8 +39,17 @@ void __libnx_initheap(void)
   {
     svcGetInfo(&mem_available, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
     svcGetInfo(&mem_used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
-    if (mem_available > mem_used + 0x200000)
-      size = (mem_available - mem_used - 0x200000) & ~0x1FFFFF;
+    // Leave headroom outside our own svcSetHeapSize request for the graphics
+    // driver's own allocations (NWindow/EGL buffers, nouveau's internal
+    // pools, Mesa's shader cache). These are allocated lazily the first time
+    // the default NWindow is touched, well after this heap is claimed, and
+    // they scale with framebuffer resolution. A thin 2MB margin was enough
+    // for the previous 1280x720 cap but isn't for native 1920x1080 docked
+    // output, and starving it manifests as an intermittent crash under GPU
+    // memory pressure (e.g. mid-scene shader compiles) rather than a clean
+    // allocation failure at startup.
+    if (mem_available > mem_used + HEAP_RESERVE_SIZE)
+      size = (mem_available - mem_used - HEAP_RESERVE_SIZE) & ~0x1FFFFF;
     if (size == 0)
       size = 0x2000000 * 16;
     Result rc = svcSetHeapSize(&addr, size);
@@ -131,6 +140,11 @@ int main(void)
   debugPrintf("\n========================================\n");
   debugPrintf("Bully NX Starting...\n");
   debugPrintf("========================================\n");
+
+  // Wire up the SIGSEGV/SIGBUS/SIGILL/SIGABRT/SIGFPE handler so a crash gets
+  // logged to bully_log.txt/bully_crash.txt instead of silently killing the
+  // process with nothing but a dangling log tail to go on.
+  install_crash_handler();
 
   // Set Mesa GPU driver optimizations & shader cache
   setenv("MESA_GLTHREAD", "false", 1);
